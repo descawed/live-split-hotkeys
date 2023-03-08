@@ -1,0 +1,19 @@
+[package]
+name = "live-split-hotkeys"
+version = "0.1.0"
+authors = ["descawed <live-split-hotkeys@descawed.com>"]
+edition = "2021"
+description = "Enables LiveSplit's global hotkeys on Linux by listening for hotkeys and forwarding them to the LiveSplit window"
+readme = "README.md"
+repository = "https://github.com/descawed/live-split-hotkeys/"
+license = "MIT"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.*"
+clap = { version = "4.1.*", features = ["derive"] }
+quick-xml = "0.27.*"
+x11rb = { version = "0.11.*", features = ["allow-unsafe-code", "xevie", "xkb"] }
+xcb = "1.2.*"
+xkbcommon = { version = "0.5.*", features = ["x11"] }
