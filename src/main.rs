@@ -1,17 +1,20 @@
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::env;
-use std::fs::File;
-use std::io::Read;
 use std::mem::size_of;
 use std::ptr::addr_of;
-use std::thread;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
+use async_std::channel::{Sender, Receiver, unbounded};
+use async_std::fs::{File, read_dir};
+use async_std::io::{Read, ReadExt};
+use async_std::path::PathBuf;
+use async_std::prelude::{FutureExt, StreamExt};
+use async_std::task;
 use clap::Parser;
+use futures::future;
 use input_event_codes_hashmap::{EV, KEY};
-use libc::{c_ulong, input_event, timeval};
+use libc::input_event;
 use procfs::process;
 use quick_xml::Reader as XmlReader;
 use quick_xml::events::Event as XmlEvent;
@@ -21,7 +24,6 @@ use x11rb::protocol::Event;
 use x11rb::protocol::xkb::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{Atom, AtomEnum, ConnectionExt as _, EventMask, GrabMode, KEY_PRESS_EVENT, KEY_RELEASE_EVENT, Keycode as X11rbKeycode, KeyButMask, KeyPressEvent, ModMask, Window};
 use x11rb::xcb_ffi::XCBConnection;
-use xcb::x::GRAB_ANY;
 use xkbcommon::xkb as xkbc;
 use xkbcommon::xkb::{Keycode, Keysym};
 
@@ -34,6 +36,11 @@ atom_manager! {
 }
 
 const NUM_HOTKEYS: usize = 8;
+static EVENT_SEQUENCE: [(u8, EventMask, bool); 3] = [
+    (KEY_RELEASE_EVENT, EventMask::KEY_RELEASE, true),
+    (KEY_PRESS_EVENT, EventMask::KEY_PRESS, true),
+    (KEY_RELEASE_EVENT, EventMask::KEY_RELEASE, false)
+];
 
 /// Listen for LiveSplit hotkeys
 #[derive(Parser, Debug)]
@@ -53,7 +60,7 @@ struct Args {
     devices: Vec<String>,
     /// How long to wait, in milliseconds, between pressing and releasing keys
     #[arg(short, long, default_value_t=50)]
-    wait: u64,
+    key_delay: u64,
 }
 
 #[derive(Debug, PartialEq)]
@@ -201,7 +208,7 @@ impl KeyState {
         let mut reader = match settings_path {
             Some(s) => XmlReader::from_file(s),
             None => XmlReader::from_file(env::var("HOME")? + "/LiveSplit/settings.cfg"),
-        }?;
+        }.context("Failed to open LiveSplit settings")?;
         reader.trim_text(true);
         let mut expect = XmlExpect::None;
         let mut hotkeys_enabled = true;
@@ -318,7 +325,27 @@ impl HotkeyListener {
         })
     }
 
-    pub fn listen(mut self) -> Result<()> {
+    async fn listen_keyboard(sender: Sender<(u32, bool)>, path: PathBuf) -> Result<()> {
+        let ev_key = EV["KEY"] as u16;
+        let mut file = File::open(path).await?;
+        loop {
+            let (type_, code, value) = {
+                let mut event_buf = [0u8; size_of::<input_event>()];
+                file.read_exact(&mut event_buf).await?;
+                // I don't think this is that bad because an input_event is ultimately all ints, so there are no invalid
+                // bit patterns, and binrw would just be reading the exact same bytes in the exact same sequence.
+                let event = unsafe { &*(addr_of!(event_buf) as *const input_event) };
+                (event.type_, event.code, event.value)
+            };
+            // 2 = autorepeat, which we don't want to listen for
+            if type_ == ev_key && value < 2 {
+                let raw_code = code as u32;
+                sender.send((raw_code, value != 0)).await?;
+            }
+        }
+    }
+
+    pub async fn listen(mut self) -> Result<()> {
         let screen = &self.conn.setup().roots[self.screen_num];
         let window = match self.args.window {
             Some(id) => id,
@@ -326,58 +353,71 @@ impl HotkeyListener {
         };
         println!("Window found: {}", window);
 
-        let ev_key = EV["KEY"] as u16;
-        let event_sequence = [(KEY_RELEASE_EVENT, EventMask::KEY_RELEASE, true), (KEY_PRESS_EVENT, EventMask::KEY_PRESS, true), (KEY_RELEASE_EVENT, EventMask::KEY_RELEASE, false)];
-        let key_delay = Duration::from_millis(self.args.wait);
-
-        let mut event_buf = [0u8; size_of::<input_event>()];
-        // TODO: look up keyboard device path
-        let mut file = File::open("/dev/input/by-path/pci-0000:00:14.0-usb-0:5.2.4:1.0-event-kbd")?;
-        loop {
-            file.read_exact(&mut event_buf)?;
-            // I don't think this is that bad because an input_event is ultimately all ints, so there are no invalid
-            // bit patterns, and binrw would just be reading the exact same bytes in the exact same sequence.
-            let event = unsafe { &*(addr_of!(event_buf) as *const input_event) };
-            // 2 = autorepeat, which we don't want to listen for
-            if event.type_ == ev_key && event.value < 2 {
-                println!("Key {} = {}", event.code, event.value);
-                let raw_code = event.code as u32;
-                let active_hotkeys = self.key_state.handle_key(raw_code, event.value != 0);
-                if !active_hotkeys.is_empty() {
-                    let focused_window = self.conn.get_input_focus()?.reply()?.focus;
-                    if focused_window == window {
-                        println!("Not sending hotkey because LiveSplit already has focus");
-                        continue;
-                    }
+        // find keyboards
+        let devices = if self.args.devices.len() > 0 {
+            self.args.devices.iter().map(PathBuf::from).collect()
+        } else {
+            let mut devices = Vec::new();
+            let mut entries = read_dir("/dev/input/by-path/").await?;
+            while let Some(entry) = entries.next().await {
+                let path = entry?.path();
+                if path.file_name().map_or(false, |n| n.to_string_lossy().ends_with("-event-kbd")) {
+                    devices.push(path);
                 }
+            }
+            devices
+        };
 
-                for keys_to_send in active_hotkeys {
-                    println!("Sending hotkey {:?}", keys_to_send);
-                    let mut event_to_send = KeyPressEvent {
-                        response_type: KEY_PRESS_EVENT,
-                        detail: 0,
-                        sequence: 0,
-                        time: x11rb::CURRENT_TIME,
-                        root: screen.root,
-                        event: window,
-                        child: x11rb::NONE,
-                        root_x: 1,
-                        root_y: 1,
-                        event_x: 1,
-                        event_y: 1,
-                        state: KeyButMask::CONTROL,
-                        same_screen: true,
-                    };
+        if devices.is_empty() {
+            return Err(anyhow!("No keyboard devices found"));
+        }
 
-                    for (response_type, mask, do_sleep) in event_sequence.iter().copied() {
-                        for key in &keys_to_send {
-                            event_to_send.response_type = response_type;
-                            event_to_send.detail = *key as X11rbKeycode;
-                            self.conn.send_event(true, window, mask, event_to_send)?.check()?;
-                        }
-                        if do_sleep {
-                            thread::sleep(key_delay);
-                        }
+        println!("Keyboards: {:?}", devices);
+        let (sender, receiver) = unbounded();
+        for device in devices {
+            task::spawn(Self::listen_keyboard(sender.clone(), device));
+        }
+
+        let key_delay = Duration::from_millis(self.args.key_delay);
+
+        loop {
+            let (code, is_pressed) = receiver.recv().await?;
+            println!("Key {} = {}", code, is_pressed);
+            let active_hotkeys = self.key_state.handle_key(code, is_pressed);
+            if !active_hotkeys.is_empty() {
+                let focused_window = self.conn.get_input_focus()?.reply()?.focus;
+                if focused_window == window {
+                    println!("Not sending hotkey because LiveSplit already has focus");
+                    continue;
+                }
+            }
+
+            for keys_to_send in active_hotkeys {
+                println!("Sending hotkey {:?}", keys_to_send);
+                let mut event_to_send = KeyPressEvent {
+                    response_type: KEY_PRESS_EVENT,
+                    detail: 0,
+                    sequence: 0,
+                    time: x11rb::CURRENT_TIME,
+                    root: screen.root,
+                    event: window,
+                    child: x11rb::NONE,
+                    root_x: 1,
+                    root_y: 1,
+                    event_x: 1,
+                    event_y: 1,
+                    state: KeyButMask::CONTROL,
+                    same_screen: true,
+                };
+
+                for (response_type, mask, do_sleep) in EVENT_SEQUENCE.iter().copied() {
+                    for key in &keys_to_send {
+                        event_to_send.response_type = response_type;
+                        event_to_send.detail = *key as X11rbKeycode;
+                        self.conn.send_event(true, window, mask, event_to_send)?.check()?;
+                    }
+                    if do_sleep {
+                        task::sleep(key_delay).await;
                     }
                 }
             }
@@ -432,7 +472,8 @@ impl HotkeyListener {
     }
 }
 
-fn main() -> Result<()> {
+#[async_std::main]
+async fn main() -> Result<()> {
     let listener = HotkeyListener::new(Args::parse())?;
-    listener.listen()
+    listener.listen().await
 }
