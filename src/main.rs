@@ -7,9 +7,9 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use async_std::channel::{Sender, Receiver, unbounded};
 use async_std::fs::{File, read_dir};
-use async_std::io::{Read, ReadExt};
+use async_std::io::ReadExt;
 use async_std::path::PathBuf;
-use async_std::prelude::{FutureExt, StreamExt};
+use async_std::prelude::StreamExt;
 use async_std::task;
 use clap::Parser;
 use futures::future;
@@ -18,14 +18,13 @@ use libc::input_event;
 use procfs::process;
 use quick_xml::Reader as XmlReader;
 use quick_xml::events::Event as XmlEvent;
-use x11rb::{atom_manager, connect};
+use x11rb::atom_manager;
 use x11rb::connection::{Connection, RequestConnection};
-use x11rb::protocol::Event;
 use x11rb::protocol::xkb::{self, ConnectionExt as _};
-use x11rb::protocol::xproto::{Atom, AtomEnum, ConnectionExt as _, EventMask, GrabMode, KEY_PRESS_EVENT, KEY_RELEASE_EVENT, Keycode as X11rbKeycode, KeyButMask, KeyPressEvent, ModMask, Window};
+use x11rb::protocol::xproto::{Atom, AtomEnum, ConnectionExt as _, EventMask, KEY_PRESS_EVENT, KEY_RELEASE_EVENT, Keycode as X11rbKeycode, KeyButMask, KeyPressEvent, Window};
 use x11rb::xcb_ffi::XCBConnection;
 use xkbcommon::xkb as xkbc;
-use xkbcommon::xkb::{Keycode, Keysym};
+use xkbcommon::xkb::Keycode;
 
 atom_manager! {
     pub AtomCollection: AtomCollectionCookie {
@@ -284,7 +283,7 @@ enum XmlExpect {
 
 struct HotkeyListener {
     args: Args,
-    xcb_conn: xcb::Connection,
+    _xcb_conn: xcb::Connection, // need to keep this alive even though we don't use it again because conn needs it
     screen_num: usize,
     conn: XCBConnection,
     atoms: AtomCollection,
@@ -317,7 +316,7 @@ impl HotkeyListener {
         let key_state = KeyState::new(&xcb_conn, args.settings.as_deref())?;
         Ok(Self {
             args,
-            xcb_conn,
+            _xcb_conn: xcb_conn,
             screen_num,
             conn,
             atoms,
@@ -392,7 +391,7 @@ impl HotkeyListener {
         }
     }
 
-    pub async fn listen(mut self) -> Result<()> {
+    pub async fn listen(self) -> Result<()> {
         let root = self.conn.setup().roots[self.screen_num].root;
         let window = match self.args.window {
             Some(id) => id,
