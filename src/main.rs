@@ -5,8 +5,8 @@ use std::ptr::addr_of;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use async_std::channel::{Sender, Receiver, unbounded};
-use async_std::fs::{File, read_dir};
+use async_std::channel::{unbounded, Receiver, Sender};
+use async_std::fs::{read_dir, File};
 use async_std::io::ReadExt;
 use async_std::path::PathBuf;
 use async_std::prelude::StreamExt;
@@ -16,12 +16,15 @@ use futures::future;
 use input_event_codes_hashmap::{EV, KEY};
 use libc::input_event;
 use procfs::process;
-use quick_xml::Reader as XmlReader;
 use quick_xml::events::Event as XmlEvent;
+use quick_xml::Reader as XmlReader;
 use x11rb::atom_manager;
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::xkb::{self, ConnectionExt as _};
-use x11rb::protocol::xproto::{Atom, AtomEnum, ConnectionExt as _, EventMask, KEY_PRESS_EVENT, KEY_RELEASE_EVENT, Keycode as X11rbKeycode, KeyButMask, KeyPressEvent, Window};
+use x11rb::protocol::xproto::{
+    Atom, AtomEnum, ConnectionExt as _, EventMask, KeyButMask, KeyPressEvent,
+    Keycode as X11rbKeycode, Window, KEY_PRESS_EVENT, KEY_RELEASE_EVENT,
+};
 use x11rb::xcb_ffi::XCBConnection;
 use xkbcommon::xkb as xkbc;
 use xkbcommon::xkb::Keycode;
@@ -38,7 +41,7 @@ const NUM_HOTKEYS: usize = 8;
 static EVENT_SEQUENCE: [(u8, EventMask, bool); 3] = [
     (KEY_RELEASE_EVENT, EventMask::KEY_RELEASE, true),
     (KEY_PRESS_EVENT, EventMask::KEY_PRESS, true),
-    (KEY_RELEASE_EVENT, EventMask::KEY_RELEASE, false)
+    (KEY_RELEASE_EVENT, EventMask::KEY_RELEASE, false),
 ];
 
 /// Listen for LiveSplit hotkeys
@@ -58,23 +61,32 @@ struct Args {
     #[arg(short, long)]
     devices: Vec<String>,
     /// How long to wait, in milliseconds, between pressing and releasing keys
-    #[arg(short, long, default_value_t=50)]
+    #[arg(short, long, default_value_t = 50)]
     key_delay: u64,
+    /// Display debug information. Specify twice to show every key event.
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbose: u8,
 }
 
 #[derive(Debug, PartialEq)]
 enum WindowMatch {
-    FullMatch(Window),
-    NameMatch(Window),
-    NoMatch,
+    Full(Window),
+    Name(Window),
+    None,
 }
 
 impl WindowMatch {
     pub fn best(self, other: Self) -> Self {
         match other {
-            Self::FullMatch(_) => other,
-            Self::NoMatch => self,
-            _ => if self == Self::NoMatch { other } else { self },
+            Self::Full(_) => other,
+            Self::None => self,
+            _ => {
+                if self == Self::None {
+                    other
+                } else {
+                    self
+                }
+            }
         }
     }
 }
@@ -82,7 +94,7 @@ impl WindowMatch {
 impl Into<Option<Window>> for WindowMatch {
     fn into(self) -> Option<Window> {
         match self {
-            Self::FullMatch(w) | Self::NameMatch(w) => Some(w),
+            Self::Full(w) | Self::Name(w) => Some(w),
             _ => None,
         }
     }
@@ -169,7 +181,11 @@ impl Keymapper {
             if let Some(code) = self.map(key) {
                 vec.push(code);
             } else {
-                return Err(anyhow!("Could not find mapping for {} in key combo {}", key, combo));
+                return Err(anyhow!(
+                    "Could not find mapping for {} in key combo {}",
+                    key,
+                    combo
+                ));
             }
         }
 
@@ -207,7 +223,8 @@ impl KeyState {
         let mut reader = match settings_path {
             Some(s) => XmlReader::from_file(s),
             None => XmlReader::from_file(env::var("HOME")? + "/LiveSplit/settings.cfg"),
-        }.context("Failed to open LiveSplit settings")?;
+        }
+        .context("Failed to open LiveSplit settings")?;
         reader.trim_text(true);
         let mut expect = XmlExpect::None;
         let mut hotkeys_enabled = true;
@@ -216,20 +233,28 @@ impl KeyState {
             match reader.read_event_into(&mut buf)? {
                 XmlEvent::Start(e) => {
                     expect = match e.name().as_ref() {
-                        b"SplitKey" | b"ResetKey" | b"SkipKey" | b"UndoKey" | b"PauseKey" | b"SwitchComparisonPrevious" | b"SwitchComparisonNext" => XmlExpect::Hotkey,
+                        b"SplitKey"
+                        | b"ResetKey"
+                        | b"SkipKey"
+                        | b"UndoKey"
+                        | b"PauseKey"
+                        | b"SwitchComparisonPrevious"
+                        | b"SwitchComparisonNext" => XmlExpect::Hotkey,
                         b"ToggleGlobalHotkeys" => XmlExpect::ToggleHotkey,
                         b"GlobalHotkeysEnabled" => XmlExpect::HotkeysEnabled,
                         _ => XmlExpect::None,
                     };
                 }
-                XmlEvent::Text(e) => {
-                    match expect {
-                        XmlExpect::Hotkey => hotkeys.push(mapper.map_combo(e.unescape()?.as_ref())?),
-                        XmlExpect::ToggleHotkey => toggle_hotkey = Some(mapper.map_combo(e.unescape()?.as_ref())?),
-                        XmlExpect::HotkeysEnabled => hotkeys_enabled = e.unescape()?.trim().eq_ignore_ascii_case("true"),
-                        _ => (),
+                XmlEvent::Text(e) => match expect {
+                    XmlExpect::Hotkey => hotkeys.push(mapper.map_combo(e.unescape()?.as_ref())?),
+                    XmlExpect::ToggleHotkey => {
+                        toggle_hotkey = Some(mapper.map_combo(e.unescape()?.as_ref())?)
                     }
-                }
+                    XmlExpect::HotkeysEnabled => {
+                        hotkeys_enabled = e.unescape()?.trim().eq_ignore_ascii_case("true")
+                    }
+                    _ => (),
+                },
                 XmlEvent::End(_) => expect = XmlExpect::None,
                 XmlEvent::Eof => break,
                 _ => (),
@@ -257,14 +282,24 @@ impl KeyState {
         if let Some(toggle_hotkey) = self.toggle_hotkey.as_deref() {
             if self.check_hotkey(key, toggle_hotkey) {
                 self.hotkeys_enabled = !self.hotkeys_enabled;
-                result.push(toggle_hotkey.iter().map(|c| (*c as Keycode) + self.min_keycode).collect());
+                result.push(
+                    toggle_hotkey
+                        .iter()
+                        .map(|c| (*c as Keycode) + self.min_keycode)
+                        .collect(),
+                );
             }
         }
 
         if self.hotkeys_enabled {
             for hotkey in &self.hotkeys {
                 if self.check_hotkey(key, hotkey) {
-                    result.push(hotkey.iter().map(|c| (*c as Keycode) + self.min_keycode).collect());
+                    result.push(
+                        hotkey
+                            .iter()
+                            .map(|c| (*c as Keycode) + self.min_keycode)
+                            .collect(),
+                    );
                 }
             }
         }
@@ -344,23 +379,34 @@ impl HotkeyListener {
         }
     }
 
-    async fn listen_keys(mut self, receiver: Receiver<(u32, bool)>, window: u32, root: Window) -> Result<()> {
+    async fn listen_keys(
+        mut self,
+        receiver: Receiver<(u32, bool)>,
+        window: u32,
+        root: Window,
+    ) -> Result<()> {
         let key_delay = Duration::from_millis(self.args.key_delay);
 
         loop {
             let (code, is_pressed) = receiver.recv().await?;
-            println!("Key {} = {}", code, is_pressed);
+            if self.args.verbose > 1 {
+                println!("Key {} = {}", code, is_pressed);
+            }
             let active_hotkeys = self.key_state.handle_key(code, is_pressed);
             if !active_hotkeys.is_empty() {
                 let focused_window = self.conn.get_input_focus()?.reply()?.focus;
                 if focused_window == window {
-                    println!("Not sending hotkey because LiveSplit already has focus");
+                    if self.args.verbose > 0 {
+                        println!("Not sending hotkey because LiveSplit already has focus");
+                    }
                     continue;
                 }
             }
 
             for keys_to_send in active_hotkeys {
-                println!("Sending hotkey {:?}", keys_to_send);
+                if self.args.verbose > 0 {
+                    println!("Sending hotkey {:?}", keys_to_send);
+                }
                 let mut event_to_send = KeyPressEvent {
                     response_type: KEY_PRESS_EVENT,
                     detail: 0,
@@ -381,7 +427,9 @@ impl HotkeyListener {
                     for key in &keys_to_send {
                         event_to_send.response_type = response_type;
                         event_to_send.detail = *key as X11rbKeycode;
-                        self.conn.send_event(true, window, mask, event_to_send)?.check()?;
+                        self.conn
+                            .send_event(true, window, mask, event_to_send)?
+                            .check()?;
                     }
                     if do_sleep {
                         task::sleep(key_delay).await;
@@ -395,19 +443,26 @@ impl HotkeyListener {
         let root = self.conn.setup().roots[self.screen_num].root;
         let window = match self.args.window {
             Some(id) => id,
-            None => self.find_window(root)?.ok_or_else(|| anyhow!("LiveSplit window not found"))?,
+            None => self
+                .find_window(root)?
+                .ok_or_else(|| anyhow!("LiveSplit window not found"))?,
         };
-        println!("Window found: {}", window);
+        if self.args.verbose > 0 {
+            println!("Window found: {}", window);
+        }
 
         // find keyboards
-        let devices = if self.args.devices.len() > 0 {
+        let devices = if !self.args.devices.is_empty() {
             self.args.devices.iter().map(PathBuf::from).collect()
         } else {
             let mut devices = Vec::new();
             let mut entries = read_dir("/dev/input/by-path/").await?;
             while let Some(entry) = entries.next().await {
                 let path = entry?.path();
-                if path.file_name().map_or(false, |n| n.to_string_lossy().ends_with("-event-kbd")) {
+                if path
+                    .file_name()
+                    .map_or(false, |n| n.to_string_lossy().ends_with("-event-kbd"))
+                {
                     devices.push(path);
                 }
             }
@@ -418,37 +473,61 @@ impl HotkeyListener {
             return Err(anyhow!("No keyboard devices found"));
         }
 
-        println!("Keyboards: {:?}", devices);
+        if self.args.verbose > 0 {
+            println!("Keyboards: {:?}", devices);
+        }
         let (sender, receiver) = unbounded();
-        let mut tasks: Vec<_> = devices.into_iter().map(|d| task::spawn(Self::listen_keyboard(sender.clone(), d))).collect();
+        let mut tasks: Vec<_> = devices
+            .into_iter()
+            .map(|d| task::spawn(Self::listen_keyboard(sender.clone(), d)))
+            .collect();
         tasks.push(task::spawn(self.listen_keys(receiver, window, root)));
         future::try_join_all(tasks).await.map(|_| ())
     }
 
-    fn window_matches(&self, window: Window, target_name: &str, pid: Option<i32>) -> Result<WindowMatch> {
+    fn window_matches(
+        &self,
+        window: Window,
+        target_name: &str,
+        pid: Option<i32>,
+    ) -> Result<WindowMatch> {
         // atoms and order taken from xdotool
-        let atoms: [Atom; 4] = [self.atoms._NET_WM_NAME.into(), AtomEnum::WM_NAME.into(), AtomEnum::STRING.into(), self.atoms.UTF8_STRING.into()];
+        let atoms: [Atom; 4] = [
+            self.atoms._NET_WM_NAME,
+            AtomEnum::WM_NAME.into(),
+            AtomEnum::STRING.into(),
+            self.atoms.UTF8_STRING,
+        ];
         for atom in atoms {
-            let result = self.conn.get_property(false, window, atom, AtomEnum::STRING, 0, u32::MAX)?;
+            let result =
+                self.conn
+                    .get_property(false, window, atom, AtomEnum::STRING, 0, u32::MAX)?;
             let reply = result.reply()?;
             let name = String::from_utf8_lossy(&reply.value);
             if name == target_name {
                 if let Some(expected_pid) = pid {
-                    let result = self.conn.get_property(false, window, self.atoms._NET_WM_PID, AtomEnum::ANY, 0, u32::MAX)?;
+                    let result = self.conn.get_property(
+                        false,
+                        window,
+                        self.atoms._NET_WM_PID,
+                        AtomEnum::ANY,
+                        0,
+                        u32::MAX,
+                    )?;
                     let reply = result.reply()?;
                     if let Some(actual_pid) = reply.value32().and_then(|i| i.last()) {
                         // per xdotool: /* The data itself is unsigned long, but everyone uses int as pid values */
                         let actual_pid = actual_pid as i32;
                         if actual_pid == expected_pid {
-                            return Ok(WindowMatch::FullMatch(window));
+                            return Ok(WindowMatch::Full(window));
                         }
                     }
                 }
-                return Ok(WindowMatch::NameMatch(window));
+                return Ok(WindowMatch::Name(window));
             }
         }
 
-        Ok(WindowMatch::NoMatch)
+        Ok(WindowMatch::None)
     }
 
     fn find_window(&self, root_window: u32) -> Result<Option<Window>> {
@@ -457,7 +536,11 @@ impl HotkeyListener {
         if pid.is_none() {
             for proc in process::all_processes()? {
                 let proc = proc?;
-                if proc.cmdline()?.last().map_or(false, |s| s.ends_with("\\LiveSplit.exe")) {
+                if proc
+                    .cmdline()?
+                    .last()
+                    .map_or(false, |s| s.ends_with("\\LiveSplit.exe"))
+                {
                     pid = Some(proc.pid);
                     break;
                 }
@@ -466,10 +549,16 @@ impl HotkeyListener {
 
         let query = self.conn.query_tree(root_window)?;
         let tree = query.reply()?;
-        Ok(tree.children.iter().copied()
+        Ok(tree
+            .children
+            .iter()
+            .copied()
             .map(|w| self.window_matches(w, "LiveSplit", pid))
-            .reduce(|acc, result| acc.and_then(|acc_match| result.map(|result_match| acc_match.best(result_match))))
-            .unwrap_or(Ok(WindowMatch::NoMatch))?.into())
+            .reduce(|acc, result| {
+                acc.and_then(|acc_match| result.map(|result_match| acc_match.best(result_match)))
+            })
+            .unwrap_or(Ok(WindowMatch::None))?
+            .into())
     }
 }
 
