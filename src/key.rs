@@ -227,7 +227,7 @@ impl KeyState {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use crate::key::Keymapper;
     use input_event_codes_hashmap::KEY;
 

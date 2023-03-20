@@ -43,7 +43,7 @@ you're done. Use `live-split-hotkeys -h` for help.
 
 ## Build
 
-You'll need to install the following packages (if I missed any, let me know):
+You'll need to install the following packages:
 
 * libxkbcommon-dev
 * libxcb-xkb-dev
