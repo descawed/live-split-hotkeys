@@ -345,11 +345,58 @@ impl HotkeyListener {
         }
     }
 
+    async fn listen_keys(mut self, receiver: Receiver<(u32, bool)>, window: u32, root: Window) -> Result<()> {
+        let key_delay = Duration::from_millis(self.args.key_delay);
+
+        loop {
+            let (code, is_pressed) = receiver.recv().await?;
+            println!("Key {} = {}", code, is_pressed);
+            let active_hotkeys = self.key_state.handle_key(code, is_pressed);
+            if !active_hotkeys.is_empty() {
+                let focused_window = self.conn.get_input_focus()?.reply()?.focus;
+                if focused_window == window {
+                    println!("Not sending hotkey because LiveSplit already has focus");
+                    continue;
+                }
+            }
+
+            for keys_to_send in active_hotkeys {
+                println!("Sending hotkey {:?}", keys_to_send);
+                let mut event_to_send = KeyPressEvent {
+                    response_type: KEY_PRESS_EVENT,
+                    detail: 0,
+                    sequence: 0,
+                    time: x11rb::CURRENT_TIME,
+                    root,
+                    event: window,
+                    child: x11rb::NONE,
+                    root_x: 1,
+                    root_y: 1,
+                    event_x: 1,
+                    event_y: 1,
+                    state: KeyButMask::CONTROL,
+                    same_screen: true,
+                };
+
+                for (response_type, mask, do_sleep) in EVENT_SEQUENCE.iter().copied() {
+                    for key in &keys_to_send {
+                        event_to_send.response_type = response_type;
+                        event_to_send.detail = *key as X11rbKeycode;
+                        self.conn.send_event(true, window, mask, event_to_send)?.check()?;
+                    }
+                    if do_sleep {
+                        task::sleep(key_delay).await;
+                    }
+                }
+            }
+        }
+    }
+
     pub async fn listen(mut self) -> Result<()> {
-        let screen = &self.conn.setup().roots[self.screen_num];
+        let root = self.conn.setup().roots[self.screen_num].root;
         let window = match self.args.window {
             Some(id) => id,
-            None => self.find_window(screen.root)?.ok_or_else(|| anyhow!("LiveSplit window not found"))?,
+            None => self.find_window(root)?.ok_or_else(|| anyhow!("LiveSplit window not found"))?,
         };
         println!("Window found: {}", window);
 
@@ -374,54 +421,9 @@ impl HotkeyListener {
 
         println!("Keyboards: {:?}", devices);
         let (sender, receiver) = unbounded();
-        for device in devices {
-            task::spawn(Self::listen_keyboard(sender.clone(), device));
-        }
-
-        let key_delay = Duration::from_millis(self.args.key_delay);
-
-        loop {
-            let (code, is_pressed) = receiver.recv().await?;
-            println!("Key {} = {}", code, is_pressed);
-            let active_hotkeys = self.key_state.handle_key(code, is_pressed);
-            if !active_hotkeys.is_empty() {
-                let focused_window = self.conn.get_input_focus()?.reply()?.focus;
-                if focused_window == window {
-                    println!("Not sending hotkey because LiveSplit already has focus");
-                    continue;
-                }
-            }
-
-            for keys_to_send in active_hotkeys {
-                println!("Sending hotkey {:?}", keys_to_send);
-                let mut event_to_send = KeyPressEvent {
-                    response_type: KEY_PRESS_EVENT,
-                    detail: 0,
-                    sequence: 0,
-                    time: x11rb::CURRENT_TIME,
-                    root: screen.root,
-                    event: window,
-                    child: x11rb::NONE,
-                    root_x: 1,
-                    root_y: 1,
-                    event_x: 1,
-                    event_y: 1,
-                    state: KeyButMask::CONTROL,
-                    same_screen: true,
-                };
-
-                for (response_type, mask, do_sleep) in EVENT_SEQUENCE.iter().copied() {
-                    for key in &keys_to_send {
-                        event_to_send.response_type = response_type;
-                        event_to_send.detail = *key as X11rbKeycode;
-                        self.conn.send_event(true, window, mask, event_to_send)?.check()?;
-                    }
-                    if do_sleep {
-                        task::sleep(key_delay).await;
-                    }
-                }
-            }
-        }
+        let mut tasks: Vec<_> = devices.into_iter().map(|d| task::spawn(Self::listen_keyboard(sender.clone(), d))).collect();
+        tasks.push(task::spawn(self.listen_keys(receiver, window, root)));
+        future::try_join_all(tasks).await.map(|_| ())
     }
 
     fn window_matches(&self, window: Window, target_name: &str, pid: Option<i32>) -> Result<WindowMatch> {
