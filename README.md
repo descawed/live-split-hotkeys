@@ -7,8 +7,9 @@ live-split-hotkeys is a small program that listens for hotkeys and forwards them
 
 Make sure you have the "Global hotkeys" option checked in LiveSplit. If you don't, check it and restart LiveSplit.
 You'll also need to make sure the program has access to your keyboard devices in `/dev/input`. The easiest way would be
-to run it with `sudo`. Then start the program after starting LiveSplit and let it run. You can kill it with ctrl+c when
-you're done. Use `live-split-hotkeys -h` for help.
+to run it with `sudo`. Then start the program after starting LiveSplit and let it run. You'll probably need to tell it
+where to find LiveSplit's settings.cfg with the `--settings` option. You can kill it with ctrl+c when you're done. Use
+`live-split-hotkeys -h` for help.
 
 ## Limitations
 
@@ -30,7 +31,8 @@ you're done. Use `live-split-hotkeys -h` for help.
 ## Troubleshooting
 
 * **Failed to open LiveSplit settings**: LiveSplit settings are assumed to be in `$HOME/LiveSplit/settings.cfg`. If
-  that's not where you have LiveSplit, pass a different path with the `--settings` option.
+  that's not where you have LiveSplit (and keep in mind `$HOME` will be `/root` if running the command with `sudo`),
+  pass a different path with the `--settings` option.
 * **No keyboard devices found**: Any device in `/dev/input/by-path/` that ends with `-event-kbd` is considered to be a
   keyboard. If your keyboard devices don't match that pattern, use the `--devices` option to tell it which device(s) to
   watch.
