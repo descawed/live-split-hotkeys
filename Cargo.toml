@@ -1,9 +1,9 @@
 [package]
 name = "live-split-hotkeys"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["descawed <live-split-hotkeys@descawed.com>"]
 edition = "2021"
-description = "Enables LiveSplit's global hotkeys on Linux by listening for hotkeys and forwarding them to the LiveSplit window"
+description = "Enables LiveSplit's global hotkeys on Linux by listening for hotkeys and forwarding them to LiveSplit"
 readme = "README.md"
 repository = "https://github.com/descawed/live-split-hotkeys/"
 license = "MIT"
