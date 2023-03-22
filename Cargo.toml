@@ -1,9 +1,9 @@
 [package]
 name = "live-split-hotkeys"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["descawed <live-split-hotkeys@descawed.com>"]
 edition = "2021"
-description = "Enables LiveSplit's global hotkeys on Linux by listening for hotkeys and forwarding them to the LiveSplit window"
+description = "Enables LiveSplit's global hotkeys on Linux by listening for hotkeys and forwarding them to LiveSplit"
 readme = "README.md"
 repository = "https://github.com/descawed/live-split-hotkeys/"
 license = "MIT"
@@ -14,11 +14,8 @@ license = "MIT"
 anyhow = "1.0.*"
 async-std = { version = "1.12.*", features = ["attributes"] }
 clap = { version = "4.1.*", features = ["derive"] }
+enum-map = "2.5.*"
 futures = "0.3.*"
 input_event_codes_hashmap = "0.1.*"
 libc = "0.2.*"
-procfs = "0.15.*"
 quick-xml = "0.28.*"
-x11rb = { version = "0.11.*", features = ["allow-unsafe-code", "xkb"] }
-xcb = "1.2.*"
-xkbcommon = { version = "0.5.*", features = ["x11"] }

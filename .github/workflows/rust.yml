@@ -16,8 +16,6 @@ jobs:
 
     steps:
     - uses: actions/checkout@v3
-    - name: Install X deps
-      run: sudo apt install -y libxkbcommon-dev libxcb-xkb-dev libxkbcommon-x11-dev
     - name: Build
       run: cargo build --verbose
     - name: Run tests

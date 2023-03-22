@@ -2,13 +2,20 @@ use std::collections::HashMap;
 use std::env;
 
 use anyhow::{anyhow, Context, Result};
+use enum_map::{Enum, EnumMap};
 use input_event_codes_hashmap::KEY;
 use quick_xml::events::Event as XmlEvent;
 use quick_xml::Reader as XmlReader;
-use xkbcommon::xkb as xkbc;
-use xkbcommon::xkb::Keycode;
 
-const NUM_HOTKEYS: usize = 8;
+#[derive(Debug, Enum, PartialEq, Clone, Copy)]
+pub enum Hotkey {
+    SplitKey,
+    ResetKey,
+    SkipKey,
+    UndoKey,
+    PauseKey,
+    ToggleGlobalHotkeys,
+}
 
 #[derive(Debug)]
 pub struct Keymapper {
@@ -105,37 +112,23 @@ impl Keymapper {
 
 #[derive(Debug, PartialEq)]
 enum XmlExpect {
-    Hotkey,
-    ToggleHotkey,
+    Hotkey(Hotkey),
     HotkeysEnabled,
     None,
 }
 
 #[derive(Debug)]
 pub struct KeyState {
-    min_keycode: Keycode,
     state: Vec<bool>,
-    hotkeys: Vec<Vec<u32>>,
-    toggle_hotkey: Option<Vec<u32>>,
+    hotkeys: EnumMap<Hotkey, Vec<u32>>,
     hotkeys_enabled: bool,
 }
 
 impl KeyState {
-    pub fn new(xcb_conn: &xcb::Connection, settings_path: Option<&str>) -> Result<Self> {
-        // get keyboard state. documentation: https://xkbcommon.org/doc/current/group__x11.html
-        let context = xkbc::Context::new(xkbc::CONTEXT_NO_FLAGS);
-        let device_id = xkbc::x11::get_core_keyboard_device_id(xcb_conn);
-        let keymap = xkbc::x11::keymap_new_from_device(
-            &context,
-            xcb_conn,
-            device_id,
-            xkbc::KEYMAP_COMPILE_NO_FLAGS,
-        );
-
-        let min_keycode = keymap.min_keycode();
-        let mut hotkeys = Vec::with_capacity(NUM_HOTKEYS - 1);
-        let mut toggle_hotkey = None;
+    pub fn new(settings_path: Option<&str>, profile: &str) -> Result<Self> {
+        let mut hotkeys = EnumMap::default();
         let mapper = Keymapper::new();
+        let profile_bytes = profile.as_bytes();
 
         // read LiveSplit settings
         let mut reader = match settings_path {
@@ -147,33 +140,50 @@ impl KeyState {
         let mut expect = XmlExpect::None;
         let mut hotkeys_enabled = true;
         let mut buf = Vec::new();
+        let mut in_profile = false;
         loop {
             match reader.read_event_into(&mut buf)? {
                 XmlEvent::Start(e) => {
                     expect = match e.name().as_ref() {
-                        b"SplitKey"
-                        | b"ResetKey"
-                        | b"SkipKey"
-                        | b"UndoKey"
-                        | b"PauseKey"
-                        | b"SwitchComparisonPrevious"
-                        | b"SwitchComparisonNext" => XmlExpect::Hotkey,
-                        b"ToggleGlobalHotkeys" => XmlExpect::ToggleHotkey,
-                        b"GlobalHotkeysEnabled" => XmlExpect::HotkeysEnabled,
+                        b"HotkeyProfile" => {
+                            if let Some(name_attr) = e
+                                .attributes()
+                                .find(|a| a.as_ref().map_or(false, |a| a.key.as_ref() == b"name"))
+                                .map(|r| r.unwrap())
+                            {
+                                in_profile = name_attr.value.as_ref() == profile_bytes;
+                            } else {
+                                in_profile = false;
+                            }
+                            XmlExpect::None
+                        }
+                        b"SplitKey" if in_profile => XmlExpect::Hotkey(Hotkey::SplitKey),
+                        b"ResetKey" if in_profile => XmlExpect::Hotkey(Hotkey::ResetKey),
+                        b"SkipKey" if in_profile => XmlExpect::Hotkey(Hotkey::SkipKey),
+                        b"UndoKey" if in_profile => XmlExpect::Hotkey(Hotkey::UndoKey),
+                        b"PauseKey" if in_profile => XmlExpect::Hotkey(Hotkey::PauseKey),
+                        b"ToggleGlobalHotkeys" if in_profile => {
+                            XmlExpect::Hotkey(Hotkey::ToggleGlobalHotkeys)
+                        }
+                        b"GlobalHotkeysEnabled" if in_profile => XmlExpect::HotkeysEnabled,
                         _ => XmlExpect::None,
                     };
                 }
-                XmlEvent::Text(e) => match expect {
-                    XmlExpect::Hotkey => hotkeys.push(mapper.map_combo(e.unescape()?.as_ref())?),
-                    XmlExpect::ToggleHotkey => {
-                        toggle_hotkey = Some(mapper.map_combo(e.unescape()?.as_ref())?)
+                XmlEvent::Text(e) => match &expect {
+                    XmlExpect::Hotkey(hotkey) => {
+                        hotkeys[*hotkey] = mapper.map_combo(e.unescape()?.as_ref())?
                     }
                     XmlExpect::HotkeysEnabled => {
                         hotkeys_enabled = e.unescape()?.trim().eq_ignore_ascii_case("true")
                     }
                     _ => (),
                 },
-                XmlEvent::End(_) => expect = XmlExpect::None,
+                XmlEvent::End(e) => {
+                    if e.name().as_ref() == b"HotkeyProfile" {
+                        in_profile = false;
+                    }
+                    expect = XmlExpect::None;
+                }
                 XmlEvent::Eof => break,
                 _ => (),
             }
@@ -182,10 +192,8 @@ impl KeyState {
         let num_keys = KEY.iter().map(|(_, code)| *code).max().unwrap() as usize;
 
         Ok(Self {
-            min_keycode,
             state: vec![false; num_keys],
             hotkeys,
-            toggle_hotkey,
             hotkeys_enabled,
         })
     }
@@ -194,32 +202,24 @@ impl KeyState {
         hotkey.iter().any(|c| *c == key) && hotkey.iter().all(|c| self.state[*c as usize])
     }
 
-    pub fn handle_key(&mut self, key: u32, is_pressed: bool) -> Vec<Vec<Keycode>> {
-        let mut result = Vec::with_capacity(NUM_HOTKEYS);
+    pub fn handle_key(&mut self, key: u32, is_pressed: bool) -> EnumMap<Hotkey, bool> {
+        let mut result = EnumMap::default();
         self.state[key as usize] = is_pressed;
-        if let Some(toggle_hotkey) = self.toggle_hotkey.as_deref() {
-            if self.check_hotkey(key, toggle_hotkey) {
-                self.hotkeys_enabled = !self.hotkeys_enabled;
-                result.push(
-                    toggle_hotkey
-                        .iter()
-                        .map(|c| (*c as Keycode) + self.min_keycode)
-                        .collect(),
-                );
-            }
-        }
 
-        if self.hotkeys_enabled {
-            for hotkey in &self.hotkeys {
-                if self.check_hotkey(key, hotkey) {
-                    result.push(
-                        hotkey
-                            .iter()
-                            .map(|c| (*c as Keycode) + self.min_keycode)
-                            .collect(),
-                    );
+        for (hotkey, combo) in &self.hotkeys {
+            let is_active = self.check_hotkey(key, combo);
+            if is_active && hotkey == Hotkey::ToggleGlobalHotkeys {
+                self.hotkeys_enabled = !self.hotkeys_enabled;
+                if !self.hotkeys_enabled {
+                    return EnumMap::default();
                 }
             }
+
+            if !self.hotkeys_enabled {
+                continue;
+            }
+
+            result[hotkey] = is_active;
         }
 
         result
