@@ -28,9 +28,7 @@ over using something like xdotool:
 * If live-split-hotkeys is running while the LiveSplit window has focus, hotkeys will be double-triggered.
 * If you change your hotkeys, you'll need to restart LiveSplit and then live-split-hotkeys. This is because
   live-split-hotkeys reads your hotkeys from LiveSplit's settings.cfg on startup, and LiveSplit only updates that file
-  when it exits. This issue could be avoided if I were to forward all key events to LiveSplit instead of only hotkey
-  events, but I wasn't sure if that would have unintended consequences (i.e. performing non-hotkey actions in
-  LiveSplit). I'm open to suggestions on better ways to handle this.
+  when it exits.
 * If you have multiple keyboard devices (which can include things like gaming mice with programmable buttons), weird
   things might happen if you press the same key(s) on more than one at the same time.
 
